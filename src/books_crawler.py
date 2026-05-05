@@ -27,12 +27,14 @@ def main() -> None:
          the DataFrame and writes every required CSV/JSON/PDF/ZIP artifact.
     """
     records: list[dict] = []
-    for item in crawler.iter_book_links():
-        html = crawler.get(item["book_url"])
-        record = book_parser.parse_book(html, item["source_category"])
-        records.append(record)
-
-    processing.run_all(records)
+    try:
+        for item in crawler.iter_book_links():
+            html = crawler.get(item["book_url"])
+            record = book_parser.parse_book(html, item["source_category"])
+            records.append(record)
+        processing.run_all(records)
+    finally:
+        crawler.close_driver()
 
 
 if __name__ == "__main__":
