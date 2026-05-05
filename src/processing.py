@@ -38,11 +38,14 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 
 # Fill these in before building the report. Members commit names/IDs together.
 STUDENT_NAMES_AND_IDS: list[tuple[str, str]] = [
-    # ("Full Name", "ID"),
+    ("Daniel Segal", "316368240"),
+    ("Tal Raiter", "208997908"),
+    ("Tomer Kadosh", "209460005"),
+    ("Moshe Ohana", "315742692"),
 ]
 
 # Whichever member's ID the team picks for the ZIP filename.
-SUBMITTING_STUDENT_ID: str = ""
+SUBMITTING_STUDENT_ID: str = "208997908"
 
 _NUMERIC_COLS = ["PriceNIS", "PriceUSD", "Year", "NumberOfReviews", "Weight"]
 
