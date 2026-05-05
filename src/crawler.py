@@ -28,6 +28,7 @@ from urllib.parse import urljoin, urlparse, urlencode, urlunparse, parse_qs
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.common.exceptions import InvalidSessionIdException
 
 BASE_URL = "https://www.bookdelivery.com/il-en/"
 REQUEST_DELAY_SEC = 3
@@ -79,6 +80,17 @@ def _get_driver() -> webdriver.Chrome:
     return _driver
 
 
+def _reset_driver() -> None:
+    """Quit the dead session (if any) and force a fresh Chrome on next use."""
+    global _driver
+    if _driver is not None:
+        try:
+            _driver.quit()
+        except Exception:
+            pass
+        _driver = None
+
+
 def close_driver() -> None:
     """Call this when the crawl is done to release the browser process."""
     global _driver
@@ -112,6 +124,10 @@ def get(url: str) -> str:
             if len(html) > 500:  # guard against blank/error pages
                 return html
             last_exc = RuntimeError(f"Page too short ({len(html)} chars): {url}")
+        except InvalidSessionIdException as exc:
+            last_exc = exc
+            print(f"[crawler] Chrome session died on {url!r}, resetting driver …")
+            _reset_driver()
         except Exception as exc:
             last_exc = exc
 
