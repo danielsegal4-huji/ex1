@@ -14,19 +14,20 @@ Public API (orchestrator only calls this):
     run_all(records: list[dict]) -> None
 
 Spec rules to enforce here:
-  * books_processed.json MUST be nested as {"records": {"record": [ {...}, ... ]}}.
+  * books_raw.json and books_processed.json MUST be nested as
+    {"records": {"record": [ {"id": "1", "url": "...", ...}, ... ]}}.
   * Per-record missing-field omission must carry through to the JSON
     (a record's dict already omits absent keys — preserve that on write).
   * Stats columns: PriceUSD, Year, StarRating, NumberOfReviews, NumberOfAuthors.
     Treat StarRating == "None" as NaN for stats.
   * Summary table must include the total number of rows.
+  * PDF is named consolidated_report.pdf and lives at the project root (also in ZIP root).
 """
 
 from __future__ import annotations
 
 import json
 import math
-import os
 import zipfile
 from pathlib import Path
 
@@ -72,8 +73,41 @@ def build_dataframe(records: list[dict]) -> pd.DataFrame:
     return df
 
 
+def _df_to_json_records(df: pd.DataFrame) -> list[dict]:
+    """Convert DataFrame rows to dicts, adding id/url, dropping NaN/None values."""
+    result = []
+    for i, (_, row) in enumerate(df.iterrows(), start=1):
+        rec: dict = {"id": str(i)}
+        url = row.get("book_url", None)
+        if url and isinstance(url, str):
+            rec["url"] = url
+        for k, v in row.to_dict().items():
+            if k == "book_url":
+                continue
+            if v is None:
+                continue
+            try:
+                if math.isnan(float(v)):
+                    continue
+            except (TypeError, ValueError):
+                pass
+            rec[k] = v
+        result.append(rec)
+    return result
+
+
+def save_raw(df: pd.DataFrame) -> None:
+    """Save the raw DataFrame (Step 2): books_raw.csv and books_raw.json."""
+    df.to_csv("output/books_raw.csv", index=False)
+
+    records = _df_to_json_records(df)
+    payload = {"records": {"record": records}}
+    with open("output/books_raw.json", "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
 def save_before_sort(df: pd.DataFrame) -> None:
-    """Print and save df.head(10) -> output/books_before_sort.csv (Step 2)."""
+    """Print and save df.head(10) -> output/books_before_sort.csv (Step 3)."""
     preview = df.head(10)
     print(preview.to_string())
     preview.to_csv("output/books_before_sort.csv", index=False)
@@ -105,27 +139,14 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
 def save_processed(df: pd.DataFrame) -> None:
     """Write the three Step-4 artifacts:
       * output/books_processed.csv
-      * output/books_processed.json    -> {"records": {"record": [ {...}, ... ]}}
+      * output/books_processed.json    -> {"records": {"record": [ {"id":..., "url":..., ...} ]}}
             Each record dict must omit keys whose value is missing (NaN / None).
       * output/books_processed_preview.csv  -> df.head(10)
     """
     df.to_csv("output/books_processed.csv", index=False)
     df.head(10).to_csv("output/books_processed_preview.csv", index=False)
 
-    records = []
-    for _, row in df.iterrows():
-        rec = {}
-        for k, v in row.to_dict().items():
-            if v is None:
-                continue
-            try:
-                if math.isnan(float(v)):
-                    continue
-            except (TypeError, ValueError):
-                pass
-            rec[k] = v
-        records.append(rec)
-
+    records = _df_to_json_records(df)
     payload = {"records": {"record": records}}
     with open("output/books_processed.json", "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -135,25 +156,22 @@ def compute_summary(df: pd.DataFrame) -> pd.DataFrame:
     """Step 5 — compute mean/std/min/max/median for:
         PriceUSD, Year, StarRating, NumberOfReviews, NumberOfAuthors.
     Treat StarRating == "None" as NaN for the calculation.
-    Append a row (or column) carrying the total number of rows in df.
+    Append a row carrying the total number of rows in df.
     Save -> output/books_summary.csv. Return the summary DataFrame.
     """
     df_stat = df.copy()
     if "StarRating" in df_stat.columns:
         df_stat["StarRating"] = pd.to_numeric(df_stat["StarRating"], errors="coerce")
 
-    cols = [c for c in ["PriceUSD", "Year", "StarRating", "NumberOfReviews", "NumberOfAuthors"] if c in df_stat.columns]
+    cols = [
+        c for c in ["PriceUSD", "Year", "StarRating", "NumberOfReviews", "NumberOfAuthors"]
+        if c in df_stat.columns
+    ]
     summary = df_stat[cols].agg(["mean", "std", "min", "max", "median"])
 
-    total_row = pd.DataFrame(
-        {c: [float("nan")] for c in cols},
-        index=["total_rows"],
-    )
-    total_row["total_rows_count"] = len(df)
-    # Store total row count in a readable way: add as a separate column on its own row
-    summary.loc["total_rows"] = float("nan")
-    summary["total_rows"] = float("nan")
-    summary.at["total_rows", cols[0]] = len(df)
+    total_row = {c: float("nan") for c in cols}
+    total_row[cols[0]] = len(df)
+    summary.loc["total_rows"] = total_row
 
     summary.to_csv("output/books_summary.csv")
     return summary
@@ -177,7 +195,6 @@ def _make_table(data: list[list]) -> Table:
                 ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
                 ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f0f0f0")]),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("WORDWRAP", (0, 0), (-1, -1), True),
             ]
         )
     )
@@ -189,22 +206,26 @@ def build_report_pdf(
     after_sort: pd.DataFrame,
     processed_preview: pd.DataFrame,
     summary: pd.DataFrame,
-    out_path: str = "output/report.pdf",
+    out_path: str = "consolidated_report.pdf",
 ) -> None:
     """Build the consolidated PDF report. Must contain:
-      * student names + IDs of all 3 members (from STUDENT_NAMES_AND_IDS)
+      * student names + IDs of all group members (from STUDENT_NAMES_AND_IDS)
       * the three 10-row preview tables (before-sort, after-sort, processed-preview)
+        with clear references to the corresponding output/ files
       * the summary statistics table
-    Suggested library: reportlab (already in requirements.txt).
     """
-    doc = SimpleDocTemplate(out_path, pagesize=letter, leftMargin=30, rightMargin=30, topMargin=40, bottomMargin=40)
+    doc = SimpleDocTemplate(
+        out_path, pagesize=letter,
+        leftMargin=30, rightMargin=30, topMargin=40, bottomMargin=40
+    )
     styles = getSampleStyleSheet()
     story = []
 
     story.append(Paragraph("HW1 — Bookdelivery.com Crawler Report", styles["Title"]))
+    story.append(Paragraph("Course 67978: A Needle in a Data Haystack", styles["Normal"]))
     story.append(Spacer(1, 12))
 
-    story.append(Paragraph("Team Members", styles["Heading2"]))
+    story.append(Paragraph("Group Members", styles["Heading2"]))
     member_data = [["Full Name", "Student ID"]]
     for name, sid in STUDENT_NAMES_AND_IDS:
         member_data.append([name, sid])
@@ -214,14 +235,15 @@ def build_report_pdf(
     story.append(Spacer(1, 16))
 
     sections = [
-        ("Books Before Sort (first 10 rows)", before_sort),
-        ("Books After Sort by Title (first 10 rows)", after_sort),
-        ("Processed Preview (first 10 rows)", processed_preview),
-        ("Summary Statistics", summary),
+        ("Books Before Sort — first 10 rows (output/books_before_sort.csv)", before_sort),
+        ("Books After Sort by Title — first 10 rows (output/books_after_sort.csv)", after_sort),
+        ("Processed Data Preview — first 10 rows (output/books_processed_preview.csv)", processed_preview),
+        ("Summary Statistics (output/books_summary.csv)", summary),
     ]
     for title, df in sections:
         story.append(Paragraph(title, styles["Heading2"]))
-        story.append(_make_table(_df_to_table_data(df.reset_index() if df.index.name or df.index.dtype != "int64" else df)))
+        display_df = df.reset_index() if (df.index.name or list(df.index) != list(range(len(df)))) else df
+        story.append(_make_table(_df_to_table_data(display_df)))
         story.append(Spacer(1, 16))
 
     doc.build(story)
@@ -231,6 +253,7 @@ def build_zip(student_id: str = "") -> None:
     """Assemble ex1p_<ID>.zip with this folder structure:
 
         ex1p_<ID>.zip
+        ├── consolidated_report.pdf
         ├── code/
         │   ├── books_crawler.py
         │   ├── crawler.py
@@ -238,13 +261,16 @@ def build_zip(student_id: str = "") -> None:
         │   ├── processing.py
         │   └── requirements.txt
         └── output/
+            ├── books_raw.csv
+            ├── books_raw.json
+            ├── books_example.json       (if present)
+            ├── books_example.jpg        (if present)
             ├── books_before_sort.csv
             ├── books_after_sort.csv
             ├── books_processed.csv
             ├── books_processed.json
             ├── books_processed_preview.csv
-            ├── books_summary.csv
-            └── report.pdf
+            └── books_summary.csv
     """
     zip_name = f"ex1p_{student_id}.zip"
 
@@ -254,16 +280,24 @@ def build_zip(student_id: str = "") -> None:
 
     code_files = ["books_crawler.py", "crawler.py", "parser.py", "processing.py"]
     output_files = [
+        "books_raw.csv",
+        "books_raw.json",
+        "books_example.json",
+        "books_example.jpg",
         "books_before_sort.csv",
         "books_after_sort.csv",
         "books_processed.csv",
         "books_processed.json",
         "books_processed_preview.csv",
         "books_summary.csv",
-        "report.pdf",
     ]
 
     with zipfile.ZipFile(zip_name, "w", zipfile.ZIP_DEFLATED) as zf:
+        # consolidated_report.pdf at ZIP root
+        report = root / "consolidated_report.pdf"
+        if report.exists():
+            zf.write(report, "consolidated_report.pdf")
+
         for fname in code_files:
             path = src_dir / fname
             if path.exists():
@@ -284,17 +318,19 @@ def run_all(records: list[dict]) -> None:
 
     Calls every step in order:
         df = build_dataframe(records)
-        save_before_sort(df)
-        df_sorted = save_after_sort(df)
-        df_proc = add_features(df_sorted)
-        save_processed(df_proc)
-        summary = compute_summary(df_proc)
-        build_report_pdf(df.head(10), df_sorted.head(10), df_proc.head(10), summary)
-        build_zip(SUBMITTING_STUDENT_ID)
+        save_raw(df)                          <- Step 2: books_raw.csv / .json
+        save_before_sort(df)                  <- Step 3: before sort preview
+        df_sorted = save_after_sort(df)       <- Step 3: after sort preview
+        df_proc = add_features(df_sorted)     <- Step 4: IsExpensive, NumberOfAuthors
+        save_processed(df_proc)               <- Step 4: processed CSV/JSON
+        summary = compute_summary(df_proc)    <- Step 5: summary stats
+        build_report_pdf(...)                 <- consolidated_report.pdf
+        build_zip(SUBMITTING_STUDENT_ID)      <- ex1p_<ID>.zip
     """
     Path("output").mkdir(exist_ok=True)
 
     df = build_dataframe(records)
+    save_raw(df)
     save_before_sort(df)
     df_sorted = save_after_sort(df)
     df_proc = add_features(df_sorted)
