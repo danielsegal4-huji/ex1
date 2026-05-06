@@ -27,6 +27,7 @@ from datetime import datetime
 from typing import Iterator
 from urllib.parse import urljoin, urlparse, urlencode, urlunparse, parse_qs
 
+import requests
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -106,10 +107,70 @@ def _reset_driver() -> None:
 
 def close_driver() -> None:
     """Call this when the crawl is done to release the browser process."""
-    global _driver
+    global _driver, _session
     if _driver is not None:
         _driver.quit()
         _driver = None
+    if _session is not None:
+        _session.close()
+        _session = None
+
+
+# ---------------------------------------------------------------------------
+# Requests session (fast path)
+# ---------------------------------------------------------------------------
+# Strategy: the site is behind AWS WAF, which requires a JS challenge to be
+# solved to obtain a session cookie. We use Selenium ONCE to solve the challenge
+# and grab the cookies, then reuse those cookies with a plain `requests.Session`
+# for every subsequent fetch. requests is roughly 10x faster than Selenium per
+# page. If the cookie ever expires (WAF challenge HTML comes back), we transparently
+# re-seed via Selenium and retry.
+
+_session: requests.Session | None = None
+
+# Substrings that appear in WAF challenge / block pages but not on real pages.
+_WAF_BODY_MARKERS = (
+    "aws waf",
+    "challenge.js",
+    "captcha-delivery",
+    "/awswaf/",
+)
+
+
+def _get_session() -> requests.Session:
+    global _session
+    if _session is None:
+        _session = requests.Session()
+        _session.headers.update({
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
+    return _session
+
+
+def _refresh_cookies_via_selenium(seed_url: str = BASE_URL) -> None:
+    """Drive Selenium to seed_url so the WAF challenge is solved, then copy
+    the resulting cookies + User-Agent into the requests.Session."""
+    driver = _get_driver()
+    _log(f"[crawler] Seeding cookies via Selenium: {seed_url}")
+    driver.get(seed_url)
+    WebDriverWait(driver, 30).until(
+        lambda d: d.execute_script("return document.readyState") == "complete"
+    )
+    time.sleep(2)  # buffer for late-rendering JS / WAF cookie set
+    session = _get_session()
+    session.cookies.clear()
+    for cookie in driver.get_cookies():
+        session.cookies.set(cookie["name"], cookie["value"])
+    session.headers["User-Agent"] = driver.execute_script("return navigator.userAgent")
+    _log(f"[crawler] Got {len(session.cookies)} cookies; UA={session.headers['User-Agent'][:60]}...")
+
+
+def _looks_like_waf_challenge(html: str, status_code: int) -> bool:
+    if status_code in (403, 429, 503):
+        return True
+    head = html[:5000].lower()
+    return any(marker in head for marker in _WAF_BODY_MARKERS)
 
 
 # ---------------------------------------------------------------------------
@@ -118,10 +179,13 @@ def close_driver() -> None:
 
 
 def get(url: str) -> str:
-    """Fetch `url` with headless Chrome and return page HTML as text.
+    """Fetch `url` and return page HTML as text.
+
+    Fast path: requests.Session with cookies seeded by Selenium (~300ms/page).
+    Slow path: if the session has no cookies yet, or the response looks like a
+    WAF challenge, re-seed via Selenium and retry once.
 
     Sleeps REQUEST_DELAY_SEC before each request (politeness).
-    Waits up to 8 s for JS rendering after the page loads.
     Retries up to 2 times on transient failures (network errors, blank pages).
     """
     max_retries = 2
@@ -131,36 +195,58 @@ def get(url: str) -> str:
         _log(f"GET  [{attempt+1}/{max_retries+1}] sleeping {REQUEST_DELAY_SEC}s before: {url}")
         time.sleep(REQUEST_DELAY_SEC)
         try:
-            driver = _get_driver()
-            _log(f"GET  [{attempt+1}/{max_retries+1}] driver.get() → {url}")
-            driver.get(url)
-            _log(f"GET  [{attempt+1}/{max_retries+1}] waiting for JS …")
-            WebDriverWait(driver, 30).until(
-                lambda d: d.execute_script("return document.readyState") == "complete"
-            )
-            time.sleep(2)  # short buffer for late-rendering JS
-            _log(f"GET  [{attempt+1}/{max_retries+1}] reading page_source …")
-            html = driver.page_source
-            if len(html) > 500:  # guard against blank/error pages
-                _log(f"GET  OK  {len(html):,} chars — {url}")
+            session = _get_session()
+
+            # First request ever - seed cookies via Selenium. Since we have to
+            # load *something* in Chrome anyway, load the URL we actually want
+            # and use its page_source directly.
+            if len(session.cookies) == 0:
+                _refresh_cookies_via_selenium(url)
+                html = _get_driver().page_source
+                if len(html) > 500:
+                    _log(f"GET  OK (selenium seed)  {len(html):,} chars - {url}")
+                    return html
+                last_exc = RuntimeError(f"Seed page too short ({len(html)} chars): {url}")
+                continue
+
+            # Fast path: HTTP request with cached WAF cookies.
+            response = session.get(url, timeout=30)
+            html = response.text
+
+            if _looks_like_waf_challenge(html, response.status_code):
+                _log(f"GET  WAF challenge detected (status={response.status_code}), re-seeding ...")
+                _refresh_cookies_via_selenium(BASE_URL)
+                response = session.get(url, timeout=30)
+                html = response.text
+                if _looks_like_waf_challenge(html, response.status_code):
+                    last_exc = RuntimeError(
+                        f"WAF challenge persists after reseed (status={response.status_code})"
+                    )
+                    continue
+
+            if len(html) > 500:
+                _log(f"GET  OK (requests)  {len(html):,} chars - {url}")
                 return html
             last_exc = RuntimeError(f"Page too short ({len(html)} chars): {url}")
             _log(f"GET  [{attempt+1}/{max_retries+1}] page too short ({len(html)} chars)")
         except InvalidSessionIdException as exc:
             last_exc = exc
-            _log(f"GET  Chrome session died on {url!r}, resetting driver …")
+            _log(f"GET  Chrome session died on {url!r}, resetting driver ...")
             _reset_driver()
         except TimeoutException as exc:
             last_exc = exc
-            _log(f"GET  JS timeout on {url!r}, resetting driver …")
+            _log(f"GET  JS timeout on {url!r}, resetting driver ...")
             _reset_driver()
+        except requests.exceptions.RequestException as exc:
+            last_exc = exc
+            _log(f"GET  HTTP error {type(exc).__name__}: {exc}")
         except Exception as exc:
             last_exc = exc
             _log(f"GET  ERROR {type(exc).__name__}: {exc}")
 
         if attempt < max_retries:
             backoff = 2 ** (attempt + 1)
-            _log(f"GET  retrying in {backoff}s …")
+            _log(f"GET  retrying in {backoff}s ...")
             time.sleep(backoff)
 
     raise RuntimeError(f"[crawler] Permanent failure fetching {url!r}") from last_exc
