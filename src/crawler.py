@@ -30,10 +30,11 @@ from urllib.parse import urljoin, urlparse, urlencode, urlunparse, parse_qs
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.common.exceptions import InvalidSessionIdException
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.common.exceptions import InvalidSessionIdException, TimeoutException
 
 BASE_URL = "https://www.bookdelivery.com/il-en/"
-REQUEST_DELAY_SEC = 3
+REQUEST_DELAY_SEC = 1
 MAX_PAGES_PER_CATEGORY = 5
 
 # ---------------------------------------------------------------------------
@@ -133,8 +134,11 @@ def get(url: str) -> str:
             driver = _get_driver()
             _log(f"GET  [{attempt+1}/{max_retries+1}] driver.get() → {url}")
             driver.get(url)
-            _log(f"GET  [{attempt+1}/{max_retries+1}] page loaded, waiting 8s for JS …")
-            time.sleep(8)
+            _log(f"GET  [{attempt+1}/{max_retries+1}] waiting for JS …")
+            WebDriverWait(driver, 30).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+            time.sleep(2)  # short buffer for late-rendering JS
             _log(f"GET  [{attempt+1}/{max_retries+1}] reading page_source …")
             html = driver.page_source
             if len(html) > 500:  # guard against blank/error pages
@@ -145,6 +149,10 @@ def get(url: str) -> str:
         except InvalidSessionIdException as exc:
             last_exc = exc
             _log(f"GET  Chrome session died on {url!r}, resetting driver …")
+            _reset_driver()
+        except TimeoutException as exc:
+            last_exc = exc
+            _log(f"GET  JS timeout on {url!r}, resetting driver …")
             _reset_driver()
         except Exception as exc:
             last_exc = exc
