@@ -21,7 +21,9 @@ Spec rules enforced here:
 from __future__ import annotations
 
 import re
+import sys
 import time
+from datetime import datetime
 from typing import Iterator
 from urllib.parse import urljoin, urlparse, urlencode, urlunparse, parse_qs
 
@@ -33,6 +35,15 @@ from selenium.common.exceptions import InvalidSessionIdException
 BASE_URL = "https://www.bookdelivery.com/il-en/"
 REQUEST_DELAY_SEC = 3
 MAX_PAGES_PER_CATEGORY = 5
+
+# ---------------------------------------------------------------------------
+# Logging helper
+# ---------------------------------------------------------------------------
+
+def _log(msg: str) -> None:
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
+
 
 # ---------------------------------------------------------------------------
 # Selenium driver (module-level singleton)
@@ -63,6 +74,7 @@ def _make_driver() -> webdriver.Chrome:
             break
 
     driver = webdriver.Chrome(options=opts)
+    driver.set_page_load_timeout(60)
     driver.execute_script(
         "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
     )
@@ -75,7 +87,7 @@ _driver: webdriver.Chrome | None = None
 def _get_driver() -> webdriver.Chrome:
     global _driver
     if _driver is None:
-        print("[crawler] Starting headless Chrome …")
+        _log("[crawler] Starting headless Chrome …")
         _driver = _make_driver()
     return _driver
 
@@ -115,25 +127,32 @@ def get(url: str) -> str:
     last_exc: Exception | None = None
 
     for attempt in range(max_retries + 1):
+        _log(f"GET  [{attempt+1}/{max_retries+1}] sleeping {REQUEST_DELAY_SEC}s before: {url}")
         time.sleep(REQUEST_DELAY_SEC)
         try:
             driver = _get_driver()
+            _log(f"GET  [{attempt+1}/{max_retries+1}] driver.get() → {url}")
             driver.get(url)
+            _log(f"GET  [{attempt+1}/{max_retries+1}] page loaded, waiting 8s for JS …")
             time.sleep(8)
+            _log(f"GET  [{attempt+1}/{max_retries+1}] reading page_source …")
             html = driver.page_source
             if len(html) > 500:  # guard against blank/error pages
+                _log(f"GET  OK  {len(html):,} chars — {url}")
                 return html
             last_exc = RuntimeError(f"Page too short ({len(html)} chars): {url}")
+            _log(f"GET  [{attempt+1}/{max_retries+1}] page too short ({len(html)} chars)")
         except InvalidSessionIdException as exc:
             last_exc = exc
-            print(f"[crawler] Chrome session died on {url!r}, resetting driver …")
+            _log(f"GET  Chrome session died on {url!r}, resetting driver …")
             _reset_driver()
         except Exception as exc:
             last_exc = exc
+            _log(f"GET  ERROR {type(exc).__name__}: {exc}")
 
         if attempt < max_retries:
             backoff = 2 ** (attempt + 1)
-            print(f"[crawler] Transient error on {url!r}, retrying in {backoff}s …")
+            _log(f"GET  retrying in {backoff}s …")
             time.sleep(backoff)
 
     raise RuntimeError(f"[crawler] Permanent failure fetching {url!r}") from last_exc
@@ -201,7 +220,7 @@ def get_book_links_from_category(category_url: str) -> list[str]:
         if current_url is None:
             break
 
-        print(f"[crawler] Fetching page {page_num}: {current_url}")
+        _log(f"[crawler] Fetching page {page_num}: {current_url}")
         html = get(current_url)
         soup = BeautifulSoup(html, "lxml")
 
@@ -210,7 +229,7 @@ def get_book_links_from_category(category_url: str) -> list[str]:
 
         page_books = _extract_book_links(soup, current_url)
         book_urls.extend(page_books)
-        print(f"[crawler]   Found {len(page_books)} book links on page {page_num}")
+        _log(f"[crawler]   Found {len(page_books)} book links on page {page_num}")
 
         if not page_books:
             # Empty page — stop early
@@ -227,7 +246,7 @@ def iter_book_links() -> Iterator[dict]:
     Yields:
         {"book_url": str, "source_category": str}
     """
-    print("[crawler] Fetching homepage …")
+    _log("[crawler] Fetching homepage …")
     homepage_html = get(BASE_URL)
     _save_local(homepage_html, "local_homepage.html")
 
@@ -239,9 +258,9 @@ def iter_book_links() -> Iterator[dict]:
 
     first_book_saved = False
     for category_name, category_url in categories:
-        print(f"[crawler] === Category: {category_name!r} — {category_url}")
+        _log(f"[crawler] === Category: {category_name!r} — {category_url}")
         book_urls = get_book_links_from_category(category_url)
-        print(f"[crawler] {len(book_urls)} book URLs in {category_name!r}")
+        _log(f"[crawler] {len(book_urls)} book URLs in {category_name!r}")
 
         for book_url in book_urls:
             if not first_book_saved:
@@ -350,4 +369,4 @@ def _save_local(html: str, filename: str) -> None:
     out = pathlib.Path("local_samples") / filename
     out.parent.mkdir(exist_ok=True)
     out.write_text(html, encoding="utf-8")
-    print(f"[crawler] Saved {out}")
+    _log(f"[crawler] Saved {out}")

@@ -11,9 +11,16 @@ Run with (from the project root):
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from . import crawler
 from . import parser as book_parser  # avoid shadowing stdlib `parser`
 from . import processing
+
+
+def _log(msg: str) -> None:
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
 
 
 def main() -> None:
@@ -28,12 +35,17 @@ def main() -> None:
     """
     records: list[dict] = []
     try:
-        for item in crawler.iter_book_links():
+        for n, item in enumerate(crawler.iter_book_links(), 1):
+            _log(f"[orchestrator] Book #{n} — fetching: {item['book_url']}")
             html = crawler.get(item["book_url"])
+            _log(f"[orchestrator] Book #{n} — parsing …")
             record = book_parser.parse_book(html, item["source_category"])
             record["book_url"] = item["book_url"]
             records.append(record)
+            _log(f"[orchestrator] Book #{n} done — title: {record.get('Title', '<missing>')!r}")
+        _log(f"[orchestrator] All {len(records)} books fetched. Running processing …")
         processing.run_all(records)
+        _log("[orchestrator] Done. All output files written.")
     finally:
         crawler.close_driver()
 
