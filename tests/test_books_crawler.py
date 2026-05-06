@@ -34,6 +34,7 @@ class ResumePersistenceTest(unittest.TestCase):
     def test_append_then_load_single_record(self):
         record = {
             "Title": "Genghis Khan",
+            "Category": "Biography",
             "Authors": "Weatherford, Jack",
             "PriceNIS": 52.35,
             "book_url": "https://example.com/book/1",
@@ -43,13 +44,13 @@ class ResumePersistenceTest(unittest.TestCase):
         records, seen = books_crawler._load_partial()
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0], record)
-        self.assertEqual(seen, {"https://example.com/book/1"})
+        self.assertEqual(seen, {("https://example.com/book/1", "Biography")})
 
     def test_append_multiple_then_load_preserves_order(self):
         records_in = [
-            {"Title": "Book A", "book_url": "https://example.com/a"},
-            {"Title": "Book B", "book_url": "https://example.com/b"},
-            {"Title": "Book C", "book_url": "https://example.com/c"},
+            {"Title": "Book A", "Category": "Art", "book_url": "https://example.com/a"},
+            {"Title": "Book B", "Category": "Law", "book_url": "https://example.com/b"},
+            {"Title": "Book C", "Category": "History", "book_url": "https://example.com/c"},
         ]
         for record in records_in:
             books_crawler._append_partial(record)
@@ -58,14 +59,45 @@ class ResumePersistenceTest(unittest.TestCase):
         self.assertEqual(records_out, records_in)
         self.assertEqual(
             seen,
-            {"https://example.com/a", "https://example.com/b", "https://example.com/c"},
+            {
+                ("https://example.com/a", "Art"),
+                ("https://example.com/b", "Law"),
+                ("https://example.com/c", "History"),
+            },
+        )
+
+    def test_same_url_under_different_categories_both_in_seen(self):
+        # The whole point of the (url, category) dedup: a book that appears
+        # under two categories must produce two distinct seen entries so a
+        # resumed run still parses it for both categories.
+        record_bio = {
+            "Title": "Napoleon",
+            "Category": "Biography",
+            "book_url": "https://example.com/napoleon",
+        }
+        record_mil = {
+            "Title": "Napoleon",
+            "Category": "Military History",
+            "book_url": "https://example.com/napoleon",
+        }
+        books_crawler._append_partial(record_bio)
+        books_crawler._append_partial(record_mil)
+
+        records, seen = books_crawler._load_partial()
+        self.assertEqual(records, [record_bio, record_mil])
+        self.assertEqual(
+            seen,
+            {
+                ("https://example.com/napoleon", "Biography"),
+                ("https://example.com/napoleon", "Military History"),
+            },
         )
 
     def test_load_skips_malformed_lines(self):
         # Hand-write a file with one good line, one corrupted line (simulating
         # a half-written record at the moment of crash), and another good line.
-        good_a = {"Title": "A", "book_url": "https://example.com/a"}
-        good_b = {"Title": "B", "book_url": "https://example.com/b"}
+        good_a = {"Title": "A", "Category": "Art", "book_url": "https://example.com/a"}
+        good_b = {"Title": "B", "Category": "Law", "book_url": "https://example.com/b"}
         with books_crawler.PARTIAL_PATH.open("w", encoding="utf-8") as f:
             f.write(json.dumps(good_a) + "\n")
             f.write('{"Title": "B", "book_url": "https://exam')  # truncated, no newline
@@ -75,22 +107,28 @@ class ResumePersistenceTest(unittest.TestCase):
 
         records, seen = books_crawler._load_partial()
         self.assertEqual(records, [good_a, good_b])
-        self.assertEqual(seen, {"https://example.com/a", "https://example.com/b"})
+        self.assertEqual(
+            seen,
+            {("https://example.com/a", "Art"), ("https://example.com/b", "Law")},
+        )
 
-    def test_record_without_book_url_loaded_but_not_in_seen(self):
-        # Defensive: if a record somehow lacks book_url, it should still load
-        # but contribute nothing to the seen set.
-        record = {"Title": "Orphan record", "PriceNIS": 10.0}
-        books_crawler._append_partial(record)
+    def test_record_missing_url_or_category_not_in_seen(self):
+        # Defensive: if a record lacks book_url OR Category, it should still
+        # load but contribute nothing to the seen set.
+        no_url = {"Title": "No URL", "Category": "Art"}
+        no_cat = {"Title": "No category", "book_url": "https://example.com/x"}
+        books_crawler._append_partial(no_url)
+        books_crawler._append_partial(no_cat)
 
         records, seen = books_crawler._load_partial()
-        self.assertEqual(records, [record])
+        self.assertEqual(records, [no_url, no_cat])
         self.assertEqual(seen, set())
 
     def test_unicode_round_trip(self):
         # Spanish accents and Hebrew characters should survive a write+read.
         record = {
             "Title": "El Reino de Hierro: Auge y Caída de Prusia",
+            "Category": "Historia",
             "Authors": "Christopher Clark",
             "PriceNIS": 118.45,
             "book_url": "https://example.com/הספר",
@@ -99,7 +137,7 @@ class ResumePersistenceTest(unittest.TestCase):
 
         records, seen = books_crawler._load_partial()
         self.assertEqual(records, [record])
-        self.assertIn("https://example.com/הספר", seen)
+        self.assertIn(("https://example.com/הספר", "Historia"), seen)
 
     def test_append_creates_parent_directory(self):
         # If output/ doesn't exist yet, _append_partial should create it.
@@ -107,7 +145,7 @@ class ResumePersistenceTest(unittest.TestCase):
         books_crawler.PARTIAL_PATH = nested
         self.assertFalse(nested.parent.exists())
 
-        books_crawler._append_partial({"Title": "X", "book_url": "https://x"})
+        books_crawler._append_partial({"Title": "X", "Category": "Y", "book_url": "https://x"})
         self.assertTrue(nested.exists())
 
 
